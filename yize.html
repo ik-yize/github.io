@@ -1,0 +1,954 @@
+"""粉金星愿 · Christmas Atelier
+
+点击窗口下方的“修改祝福”即可换文字，设置会保存在“祝福文字.txt”。
+有 Pillow 时使用柔光合成渲染；没有时自动使用标准库绘制。
+鼠标拖动旋转，滚轮缩放，点击星星许愿，点击空白处绽放爱心。
+"""
+
+import ctypes
+import math
+import os
+from pathlib import Path
+import random
+import struct
+import sys
+import tempfile
+import time
+import tkinter as tk
+from tkinter import font as tkfont
+from tkinter import messagebox
+import zlib
+
+
+# ---------- 这里可以自己修改 ----------
+MESSAGE = "滢滢天天开心"
+SUBTITLE = "愿你的每一天，都被温柔与爱包围"
+WINDOW_TITLE = "粉金星愿 · Merry Christmas"
+FPS = 60
+# 粒子数量比例：电脑较慢时可改为 0.7，建议范围 0.5～1.5。
+QUALITY = 1.0
+# ------------------------------------
+
+WIDTH, HEIGHT = 900, 980
+BG = "#100d19"
+PALETTE = ("#f5a4cc", "#df64a7", "#ffe2d2", "#fff2dd")
+DEFAULT_TEXT = {"主祝福": MESSAGE, "副祝福": SUBTITLE,
+                "英文标题": "Merry Christmas", "顶部小字": "W I N T E R   W I S H E S"}
+TEXT_LIMITS = {"主祝福": 24, "副祝福": 48, "英文标题": 40, "顶部小字": 40}
+APP_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
+USER_DIR = Path(os.environ.get("LOCALAPPDATA", str(APP_DIR))) / "ChristmasAtelier"
+CONFIG_NAME = "祝福文字.txt"
+TAU = math.tau
+SUPPORT = Path(__file__).resolve().parent / "_tk_support"
+if str(tk.TclVersion) == "9.0" and (SUPPORT / "tcl9.0" / "init.tcl").is_file():
+    os.environ.setdefault("TCL_LIBRARY", str(SUPPORT / "tcl9.0"))
+    os.environ.setdefault("TK_LIBRARY", str(SUPPORT / "tk9.0"))
+
+# 完整文件包附带 Windows / Python 3.15 的 Pillow，其他环境优先用已安装版本。
+RENDER_SUPPORT = Path(__file__).resolve().parent / "_render_support" / f"py{sys.version_info.major}{sys.version_info.minor}"
+if RENDER_SUPPORT.is_dir() and os.name == "nt":
+    sys.path.insert(0, str(RENDER_SUPPORT))
+try:
+    from PIL import Image, ImageTk
+except ImportError:
+    Image = ImageTk = None
+
+
+def clamp(value, low=0.0, high=1.0):
+    return max(low, min(high, value))
+
+
+def rgb(color):
+    return tuple(int(color[i:i + 2], 16) for i in (1, 3, 5))
+
+
+def mix(first, second, amount):
+    amount = clamp(amount)
+    return "#" + "".join(f"{round(a + (b - a) * amount):02x}"
+                         for a, b in zip(rgb(first), rgb(second)))
+
+
+def smooth(value):
+    value = clamp(value)
+    return value * value * (3 - 2 * value)
+
+
+def clean_text(values, strict=False):
+    result = {}
+    for key, default in DEFAULT_TEXT.items():
+        value = str(values.get(key, default)).replace("\r", " ").replace("\n", " ").replace("\t", " ").strip()
+        if strict and len(value) > TEXT_LIMITS[key]:
+            raise ValueError(f"{key}最多填写 {TEXT_LIMITS[key]} 个字，请稍微缩短一些。")
+        if key in ("主祝福", "英文标题") and not value:
+            if strict:
+                raise ValueError(f"请填写{key}。")
+            value = default
+        result[key] = value[:TEXT_LIMITS[key]]
+    return result
+
+
+def load_text(directory=None):
+    candidates = [Path(directory) / CONFIG_NAME] if directory is not None else [APP_DIR / CONFIG_NAME, USER_DIR / CONFIG_NAME]
+    candidates = [p for p in candidates if p.is_file()]
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    for path in candidates:
+        try:
+            values = dict(DEFAULT_TEXT)
+            for line in path.read_text(encoding="utf-8-sig").splitlines():
+                if line.strip().startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                if key.strip() in values:
+                    values[key.strip()] = value.strip()
+            return clean_text(values)
+        except (OSError, UnicodeError):
+            continue
+    return dict(DEFAULT_TEXT)
+
+
+def save_text(values, directory=None):
+    values = clean_text(values, strict=True)
+    content = ("# 可以在程序的“修改祝福”中填写，也可以修改下面等号右边的文字。\n"
+               "# 保存此文件后，重新打开圣诞树即可生效。请保留等号左边的名称。\n"
+               + "\n".join(f"{key}={values[key]}" for key in DEFAULT_TEXT) + "\n")
+    folders = [Path(directory)] if directory is not None else [APP_DIR, USER_DIR]
+    last_error = None
+    for folder in folders:
+        temporary = None
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8-sig", dir=folder,
+                                             prefix=".christmas_", suffix=".tmp", delete=False) as stream:
+                temporary = Path(stream.name)
+                stream.write(content)
+            destination = folder / CONFIG_NAME
+            os.replace(temporary, destination)
+            return destination
+        except OSError as error:
+            last_error = error
+        finally:
+            if temporary is not None and temporary.exists():
+                temporary.unlink(missing_ok=True)
+    raise last_error
+
+
+def heart(angle):
+    return (math.sin(angle) ** 3,
+            -(13 * math.cos(angle) - 5 * math.cos(2 * angle)
+              - 2 * math.cos(3 * angle) - math.cos(4 * angle)) / 16)
+
+
+def png_rgba(size, pixels):
+    """生成带真正透明度的 PNG，不需要 Pillow 或外部图片。"""
+    def chunk(kind, data):
+        return (struct.pack(">I", len(data)) + kind + data
+                + struct.pack(">I", zlib.crc32(kind + data) & 0xffffffff))
+    rows = b"".join(b"\x00" + pixels[y * size * 4:(y + 1) * size * 4]
+                    for y in range(size))
+    return (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 6, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(rows, 6)) + chunk(b"IEND", b""))
+
+
+class SpriteBank:
+    """复用柔光贴图，避免每一帧重新生成像素。"""
+
+    def __init__(self, root, scale):
+        self.root, self.scale = root, scale
+        self.cache = {}
+        self.pixels = {}
+
+    def glow(self, color, radius, opacity=1.0, soft=False):
+        key = (color, radius, opacity, soft)
+        if key in self.cache:
+            return self.cache[key]
+        radius = max(0.45, radius * self.scale)
+        extent = math.ceil(radius * (3.4 if soft else 5.0))
+        size, center = extent * 2 + 1, extent
+        red, green, blue = rgb(color)
+        pixels = bytearray(size * size * 4)
+        for y in range(size):
+            for x in range(size):
+                d2 = ((x - center) ** 2 + (y - center) ** 2) / (radius * radius)
+                if soft:
+                    alpha = opacity * math.exp(-d2 * 0.55)
+                else:
+                    alpha = opacity * (0.90 * math.exp(-d2 * 1.75)
+                                       + 0.105 * math.exp(-d2 * 0.15))
+                pos = (y * size + x) * 4
+                pixels[pos:pos + 4] = bytes((red, green, blue,
+                                            round(clamp(alpha) * 255)))
+        image = tk.PhotoImage(master=self.root, data=png_rgba(size, pixels), format="png")
+        self.cache[key] = image
+        self.pixels[str(image)] = (size, pixels)
+        return image
+
+
+class ChristmasAtelier:
+    def __init__(self, root, animate=True, config_dir=None):
+        self.root = root
+        self.config_dir = config_dir
+        self.words = load_text(config_dir)
+        self.settings_window = None
+        self.text_started = 2.4
+        self.rotation = 0.0
+        self.zoom = self.zoom_target = 1.0
+        self.dragging = self.drag_moved = False
+        self.drag_start = self.drag_last = (0, 0)
+        self.star_magic = 0.0
+        self.hover_star = False
+        self.next_wish = -1.0
+        self.mouse_trail = []
+        self.trail_distance = 0.0
+        self.next_trail = 0.0
+        self.toast_until = 0.0
+        root.title(WINDOW_TITLE)
+        root.configure(bg=BG)
+        screen_w, screen_h = root.winfo_screenwidth(), root.winfo_screenheight()
+        scale = min(1.0, (screen_w - 80) / WIDTH, (screen_h - 110) / HEIGHT)
+        width, height = round(WIDTH * scale), round(HEIGHT * scale)
+        root.geometry(f"{width}x{height}+{max(0, (screen_w - width) // 2)}+30")
+        root.minsize(460, 530)
+        self.canvas = tk.Canvas(root, bg=BG, highlightthickness=0)
+        self.canvas.pack(fill="both", expand=True)
+        self.w, self.h = width, height
+        self.scale, self.ox, self.oy = scale, 0, 0
+        self.elapsed = 0.0
+        self.last = time.perf_counter()
+        self.running, self.paused, self.fullscreen = True, False, False
+        self.job = self.resize_job = None
+        self.mouse_x = self.mouse_y = self.camera_x = self.camera_y = 0.0
+        self.frame, self.last_sort, self.last_text = 0, -1.0, None
+        self.particles, self.snow, self.sparks, self.bursts = [], [], [], []
+        self.rng = random.Random()
+        self.timer_enabled = False
+        self.raster_mode = Image is not None
+        if os.name == "nt":
+            try:
+                self.timer_enabled = ctypes.windll.winmm.timeBeginPeriod(1) == 0
+            except (AttributeError, OSError):
+                pass
+        self.canvas.bind("<Configure>", self.resize)
+        self.canvas.bind("<Motion>", self.motion)
+        self.canvas.bind("<Leave>", lambda event: self.set_mouse(0, 0))
+        self.canvas.bind("<ButtonPress-1>", self.press)
+        self.canvas.bind("<B1-Motion>", self.drag)
+        self.canvas.bind("<ButtonRelease-1>", self.release)
+        self.canvas.bind("<MouseWheel>", self.wheel)
+        self.canvas.bind("<Button-4>", lambda event: self.wheel(event, 1))
+        self.canvas.bind("<Button-5>", lambda event: self.wheel(event, -1))
+        self.canvas.bind("<Double-Button-3>", self.reset_view)
+        root.bind("<F11>", self.toggle_fullscreen)
+        root.bind("<Escape>", self.escape)
+        root.bind("<space>", self.toggle_pause)
+        root.protocol("WM_DELETE_WINDOW", self.close)
+        self.build()
+        if animate:
+            self.tick()
+
+    def xy(self, x, y):
+        return self.ox + x * self.scale, self.oy + y * self.scale
+
+    def coords(self, item, x, y):
+        self.canvas.coords(item, *self.xy(x, y))
+
+    def line(self, points, **kwargs):
+        values = [coord for point in points for coord in self.xy(*point)]
+        return self.canvas.create_line(*values, **kwargs)
+
+    def text(self, x, y, value, size, color, family="Microsoft YaHei UI", **kwargs):
+        return self.canvas.create_text(*self.xy(x, y), text=value, fill=color,
+                                       font=(family, -max(8, round(size * self.scale))),
+                                       tags=kwargs.pop("tags", "foreground"), **kwargs)
+
+    def fit_text(self, value, size, width, family="Microsoft YaHei UI"):
+        font = tkfont.Font(root=self.root, family=family, size=-max(8, round(size * self.scale)))
+        measured = font.measure(value)
+        return max(8, min(size, size * width * self.scale / max(1, measured)))
+
+    def scene_point(self, x, y):
+        return 450 + (x - 450) * self.zoom, 480 + (y - 480) * self.zoom
+
+    def image(self, x, y, image, **kwargs):
+        item = self.canvas.create_image(*self.xy(x, y), image=image, **kwargs)
+        if getattr(self, "static_mode", False):
+            self.static_images.append((item, *self.xy(x, y), str(image)))
+        return item
+
+    def resize(self, event):
+        if (event.width, event.height) == (self.w, self.h):
+            return
+        self.w, self.h = max(1, event.width), max(1, event.height)
+        if self.resize_job is not None:
+            self.root.after_cancel(self.resize_job)
+        self.resize_job = self.root.after(180, self.build)
+
+    def background(self, rng):
+        # 四分之一面积的渐变底图，经 Tk 放大；动画只需更新前景粒子。
+        w, h = math.ceil(self.w / 2), math.ceil(self.h / 2)
+        pixels = bytearray(w * h * 3)
+        for y in range(h):
+            yy = (y * 2 - self.oy) / self.scale
+            for x in range(w):
+                xx = (x * 2 - self.ox) / self.scale
+                rose = math.exp(-((xx - 450) / 270) ** 2 - ((yy - 490) / 330) ** 2)
+                gold = math.exp(-((xx - 450) / 190) ** 2 - ((yy - 730) / 48) ** 2)
+                vignette = clamp(1 - ((xx - 450) / 650) ** 2 - ((yy - 490) / 850) ** 2)
+                noise = rng.uniform(-0.7, 0.7)
+                pos = (y * w + x) * 3
+                pixels[pos:pos + 3] = bytes((round(12 + 17 * rose + 14 * gold + 3 * vignette + noise),
+                                            round(11 + 3 * rose + 5 * gold + 2 * vignette + noise),
+                                            round(20 + 14 * rose + 7 * gold + 4 * vignette + noise)))
+        rows = []
+        for y in range(h):
+            row = b"".join(pixels[(y * w + x) * 3:(y * w + x + 1) * 3] * 2 for x in range(w))
+            rows.append(row * 2)
+        self.bg_pixels = bytearray(b"".join(rows))
+        self.raster_w, self.raster_h = w * 2, h * 2
+        self.bg_header = f"P6\n{w * 2} {h * 2}\n255\n".encode()
+        self.bg_image = tk.PhotoImage(master=self.root, data=self.bg_header + self.bg_pixels, format="PPM")
+        self.canvas.create_image(0, 0, image=self.bg_image, anchor="nw")
+
+    def bake_static(self):
+        """只合成不移动的背景光斑；树身仍然逐点参与动画。"""
+        width, height = self.raster_w, self.raster_h
+        target = self.bg_pixels
+        for item, x, y, image_name in self.static_images:
+            size, source = self.bank.pixels[image_name]
+            left, top = round(x) - size // 2, round(y) - size // 2
+            for sy in range(max(0, -top), min(size, height - top)):
+                for sx in range(max(0, -left), min(size, width - left)):
+                    src = (sy * size + sx) * 4
+                    alpha = source[src + 3]
+                    if not alpha:
+                        continue
+                    dst = ((top + sy) * width + left + sx) * 3
+                    for channel in range(3):
+                        target[dst + channel] = (source[src + channel] * alpha
+                                                  + target[dst + channel] * (255 - alpha) + 127) // 255
+            self.canvas.delete(item)
+        self.bg_image.configure(data=self.bg_header + target, format="PPM")
+        self.static_images.clear()
+        self.static_mode = False
+
+    def build(self):
+        self.resize_job = None
+        self.scale = min(self.w / WIDTH, self.h / HEIGHT)
+        self.ox = (self.w - WIDTH * self.scale) / 2
+        self.oy = (self.h - HEIGHT * self.scale) / 2
+        self.canvas.delete("all")
+        self.particles.clear()
+        self.snow.clear()
+        self.sparks.clear()
+        self.bursts.clear()
+        self.mouse_trail.clear()
+        self.last_sort, self.last_text = -1.0, None
+        self.bank = SpriteBank(self.root, self.scale)
+        self.static_mode, self.static_images = True, []
+        rng = random.Random(1225)
+        self.background(rng)
+        # 远景散焦光斑，亮度刻意压低。
+        for _ in range(18):
+            x, y = rng.uniform(75, 825), rng.uniform(175, 770)
+            if abs(x - 450) < 190:
+                x += 235 if x > 450 else -235
+            self.image(x, y, self.bank.glow("#c881a7", rng.choice((7, 12, 19)), 0.045, True))
+        self.image(450, 730, self.bank.glow("#ef9ab9", 62, 0.10, True))
+        for _ in range(75):
+            x, y = rng.uniform(50, 850), rng.uniform(175, 770)
+            self.image(x, y, self.bank.glow("#d6b8cb", 0.65, 0.3))
+
+        self.draw_headings()
+        self.line(((351, 151), (420, 151)), fill="#654151", width=1)
+        self.line(((480, 151), (549, 151)), fill="#654151", width=1)
+        self.text(450, 151, "✦", 13, "#c3998b", "Segoe UI Symbol")
+
+        # 极淡的椭圆光池和散落星尘。
+        for i in range(155):
+            angle = i / 155 * TAU
+            r = 232 + rng.uniform(-8, 8)
+            self.image(450 + r * math.cos(angle), 729 + 24 * math.sin(angle),
+                       self.bank.glow("#e7a8b9", rng.choice((0.6, 0.9)), rng.choice((0.18, 0.32))))
+        for _ in range(90):
+            x = rng.gauss(450, 128)
+            y = 730 + rng.gauss(0, 15)
+            self.image(x, y, self.bank.glow("#f4c7af", rng.choice((0.65, 1.0)), 0.28))
+
+        self.bake_static()
+
+        # 所有树身粒子参与同一个三维旋转，没有烘焙固定的树身。
+        for layer in range(48):
+            u = (layer + 0.8) / 48
+            scallop = 0.79 + 0.21 * ((u * 8) % 1) ** 0.6
+            radius = 222 * u ** 0.86 * scallop
+            count = round((11 + 33 * u) * clamp(QUALITY, 0.5, 1.5))
+            for j in range(count):
+                angle = j / count * TAU + layer * 2.39996 + rng.uniform(-0.12, 0.12)
+                r = radius * rng.uniform(0.50, 1.03)
+                palette = rng.choices((0, 1, 2), (0.64, 0.29, 0.07))[0]
+                self.add_particle(r * math.cos(angle), 252 + u * 444 + rng.uniform(-5, 5),
+                                  r * math.sin(angle), rng.choice((0, 0, 1, 1, 2)),
+                                  palette, rng.uniform(0, TAU))
+        # 在每个分枝上添出向外下垂的亮点，树形比规则圆锥更自然。
+        for tier in range(1, 10):
+            u = tier / 9
+            for branch in range(9):
+                a = branch / 9 * TAU + tier * 1.7
+                for segment in range(6):
+                    v = 0.45 + segment * 0.105
+                    r = 213 * u ** 0.88 * v
+                    angle = a + 0.1 * math.sin(v * 5)
+                    self.add_particle(r * math.cos(angle), 250 + u * 439 + 13 * v * v,
+                                      r * math.sin(angle), 0 if segment % 2 else 1,
+                                      0, rng.uniform(0, TAU), kind="branch")
+        # 两条微错开的香槟色灯带，前后遮挡随深度一起更新。
+        for i in range(round(270 * clamp(QUALITY, 0.5, 1.5))):
+            u = i / max(1, round(270 * clamp(QUALITY, 0.5, 1.5)) - 1)
+            angle = -0.7 + u * TAU * 4.3
+            r = 8 + 217 * u ** 0.9
+            self.add_particle(r * math.cos(angle), 253 + 449 * u, r * math.sin(angle),
+                              2 if i % 5 else 3, 2 if i % 7 else 3,
+                              angle, kind="ribbon")
+        # 零星珠饰；不堆叠大块光斑。
+        for i in range(30):
+            u = rng.uniform(0.15, 0.97)
+            angle = i * 2.39996
+            r = 198 * u ** 0.88
+            self.add_particle(r * math.cos(angle), 252 + u * 445,
+                              r * math.sin(angle), 3, 3 if i % 3 == 0 else 0,
+                              rng.uniform(0, TAU), kind="jewel")
+        for i in range(15):
+            self.add_particle(rng.uniform(-5, 5), 699 + rng.uniform(0, 25),
+                              rng.uniform(-4, 4), 0, 2, i)
+
+        # 为不同深度预生成有限组贴图。
+        self.sprites = {}
+        self.colors = {}
+        for palette, color in enumerate(PALETTE):
+            for size, radius in enumerate((0.8, 1.12, 1.5, 2.1)):
+                for shade in range(8):
+                    self.sprites[palette, size, shade] = self.bank.glow(
+                        color, radius, 0.18 + shade * 0.11)
+                    self.colors[palette, shade] = mix("#241629", color, 0.18 + shade * 0.11)
+        if self.raster_mode:
+            self.base_frame = Image.frombytes("RGB", (self.raster_w, self.raster_h), bytes(self.bg_pixels))
+            self.frame_image = ImageTk.PhotoImage(self.base_frame, master=self.root)
+            self.tree_layer = self.canvas.create_image(0, 0, image=self.frame_image, anchor="nw", tags="tree")
+            self.pil_sprites = {}
+            for key, image in self.sprites.items():
+                size, data = self.bank.pixels[str(image)]
+                self.pil_sprites[key] = Image.frombytes("RGBA", (size, size), bytes(data))
+            self.draw_order = list(self.particles)
+        for i, p in enumerate(self.particles):
+            p["item"] = None
+            p["halo"] = None
+            if self.raster_mode:
+                continue
+            if p["kind"] == "jewel" or (p["kind"] == "ribbon" and i % 13 == 0) or i % 83 == 0:
+                p["halo"] = self.image(450, 480, self.sprites[p["color"], p["size"], 0], tags="tree")
+            p["item"] = self.canvas.create_oval(0, 0, 0, 0, fill=self.colors[p["color"], 0],
+                                                 outline="", tags="tree")
+
+        self.star_halo = self.image(450, 232, self.bank.glow("#ffd6b3", 21, 0.23, True), tags="star")
+        self.star_glow = self.image(450, 232, self.bank.glow("#ffe6c4", 5.0, 0.65), tags="star")
+        self.star = self.canvas.create_polygon(0, 0, 0, 0, 0, 0,
+                                               fill="#ffe9c9", outline="#fff6e7",
+                                               width=max(1, self.scale), tags="star")
+        self.star_rays = [self.line(((450, 232), (450, 232)), fill="#9b746d", tags="star")
+                          for _ in range(8)]
+
+        # 不同景深的雪花：远处慢而细，近处大而柔。
+        for i in range(105):
+            near = i % 12 == 0
+            depth = 1 if near else (0.55 if i % 3 == 0 else 0.25)
+            radius = rng.choice((1.5, 2.0)) if near else rng.choice((0.55, 0.8))
+            sprite = None
+            if self.raster_mode or near:
+                image = self.bank.glow("#f7e8f2", radius, 0.55 if near else 0.32)
+                if self.raster_mode:
+                    size, data = self.bank.pixels[str(image)]
+                    sprite = Image.frombytes("RGBA", (size, size), bytes(data))
+                    item = None
+                else:
+                    item = self.image(0, 0, image, tags="snow")
+            else:
+                item = self.canvas.create_oval(0, 0, 0, 0, fill="#867281", outline="", tags="snow")
+            self.snow.append(dict(item=item, sprite=sprite, near=near, radius=radius,
+                                  x=rng.uniform(-30, 930), y=rng.uniform(-20, HEIGHT),
+                                  depth=depth, speed=9 + depth * 24,
+                                  phase=rng.uniform(0, TAU)))
+        for i in range(12):
+            x, y = rng.uniform(225, 680), rng.uniform(270, 700)
+            rays = [self.line(((x, y), (x, y)), fill="#a47b88", tags="spark") for _ in range(2)]
+            self.sparks.append(dict(x=x, y=y, phase=i * 1.41, rays=rays))
+
+        # 文案留出独立空间，淡入时保留每个汉字的轻微延迟。
+        self.letters = []
+        message = self.words["主祝福"]
+        gap = min(48, 740 / max(1, len(message)))
+        for i, char in enumerate(message):
+            x = 450 + (i - (len(message) - 1) / 2) * gap
+            item = self.text(x, 808, char, min(35, gap * 0.83), BG, state="hidden", tags=("foreground", "blessing"))
+            self.letters.append((item, x, i))
+        subtitle = self.words["副祝福"]
+        self.subtitle = self.text(450, 865, subtitle, self.fit_text(subtitle, 14, 730), BG,
+                                  tags=("foreground", "blessing"))
+        self.line(((410, 908), (434, 908)), fill="#573746", tags="foreground")
+        self.line(((466, 908), (490, 908)), fill="#573746", tags="foreground")
+        self.text(450, 908, "♡", 17, "#be879e", "Segoe UI Symbol")
+        self.text(450, 923, "拖动旋转  ·  滚轮缩放  ·  点击星星许愿", 10, "#967b8c")
+        self.draw_controls()
+        self.toast = self.text(450, 775, "", 12, "#ebc6d8", state="hidden")
+        self.pause_label = self.text(450, 185, "P A U S E D", 10, "#c1a3ae", "Georgia", state="hidden")
+        if self.paused:
+            self.canvas.itemconfigure(self.pause_label, state="normal")
+        self.update_scene(0, force=True)
+
+    def draw_headings(self):
+        self.canvas.delete("headings")
+        for y, key, size, color in ((57, "顶部小字", 11, "#b493a2"), (108, "英文标题", 43, "#f6dfd9")):
+            value = self.words[key]
+            self.text(450, y, value, self.fit_text(value, size, 720, "Georgia"), color, "Georgia",
+                      tags=("foreground", "headings"))
+
+    def draw_controls(self):
+        self.controls = {}
+        for x, key, label in ((270, "settings", "修改祝福"), (390, "pause", "继续" if self.paused else "暂停"),
+                              (510, "reset", "重置视角"), (630, "fullscreen", "退出全屏" if self.fullscreen else "全屏")):
+            tag = "control:" + key
+            box = self.canvas.create_rectangle(*self.xy(x - 53, 941), *self.xy(x + 53, 971),
+                                                fill="#241b2b", outline="#684052", width=1,
+                                                tags=("foreground", tag))
+            text = self.text(x, 956, label, 12, "#e7bdce", tags=("foreground", tag))
+            self.controls[key] = box, text
+            self.canvas.tag_bind(tag, "<Enter>", lambda event, item=box: self.hover_control(item, True))
+            self.canvas.tag_bind(tag, "<Leave>", lambda event, item=box: self.hover_control(item, False))
+
+    def hover_control(self, item, entered):
+        self.canvas.itemconfigure(item, fill="#392436" if entered else "#241b2b")
+        self.canvas.configure(cursor="hand2" if entered else "")
+
+    def notify(self, value, seconds=2.6):
+        self.canvas.itemconfigure(self.toast, text=value, state="normal")
+        self.toast_until = time.perf_counter() + seconds
+
+    def apply_words(self, values):
+        self.words = clean_text(values, strict=True)
+        self.canvas.delete("blessing")
+        self.draw_headings()
+        self.letters = []
+        message = self.words["主祝福"]
+        gap = min(48, 740 / max(1, len(message)))
+        for i, char in enumerate(message):
+            x = 450 + (i - (len(message) - 1) / 2) * gap
+            item = self.text(x, 808, char, min(35, gap * 0.83), "#f6d6e2", tags=("foreground", "blessing"))
+            self.letters.append((item, x, i))
+        subtitle = self.words["副祝福"]
+        self.subtitle = self.text(450, 865, subtitle, self.fit_text(subtitle, 14, 730), "#c79caf",
+                                  tags=("foreground", "blessing"))
+        self.text_started = self.elapsed - 4
+        self.last_text = None
+        self.update_scene(0, force=True)
+
+    def open_settings(self):
+        if self.settings_window is not None and self.settings_window.winfo_exists():
+            self.settings_window.lift()
+            return
+        panel = self.settings_window = tk.Toplevel(self.root)
+        panel.title("修改祝福 · 粉金星愿")
+        panel.configure(bg="#1b1423")
+        panel.transient(self.root)
+        panel.resizable(False, False)
+        width, height = 560, 580
+        panel.geometry(f"{width}x{height}+{max(0, self.root.winfo_rootx() + (self.w - width) // 2)}+{max(20, self.root.winfo_rooty() + (self.h - height) // 2)}")
+        tk.Label(panel, text="把祝福写给 TA", font=("Microsoft YaHei UI", 19),
+                 bg="#1b1423", fg="#f4d3e1").pack(anchor="w", padx=32, pady=(25, 5))
+        tk.Label(panel, text="保存后马上生效，下次打开也会保留。", font=("Microsoft YaHei UI", 10),
+                 bg="#1b1423", fg="#bb97ac").pack(anchor="w", padx=32, pady=(0, 16))
+        entries = {}
+        for key in DEFAULT_TEXT:
+            tk.Label(panel, text=f"{key}  ·  最多 {TEXT_LIMITS[key]} 个字", font=("Microsoft YaHei UI", 10),
+                     bg="#1b1423", fg="#d7b4c7").pack(anchor="w", padx=32, pady=(7, 4))
+            entry = tk.Entry(panel, font=("Microsoft YaHei UI", 12), bg="#2a2033", fg="#fff0f5",
+                             insertbackground="#ffbfda", relief="flat", highlightthickness=1,
+                             highlightbackground="#654158", highlightcolor="#d993b8")
+            entry.insert(0, self.words[key])
+            entry.pack(fill="x", padx=32, ipady=7)
+            entries[key] = entry
+        status = tk.Label(panel, text="字号会自动适应，树身和灯光效果保持不变。", wraplength=490,
+                          font=("Microsoft YaHei UI", 10), bg="#1b1423", fg="#ba98ad")
+        status.pack(anchor="w", padx=32, pady=(16, 8))
+        row = tk.Frame(panel, bg="#1b1423")
+        row.pack(fill="x", padx=32, pady=10)
+
+        def save():
+            try:
+                values = clean_text({key: field.get() for key, field in entries.items()}, strict=True)
+                save_text(values, self.config_dir)
+            except ValueError as error:
+                status.configure(text=str(error), fg="#ffc1d7")
+                return
+            except OSError:
+                status.configure(text="暂时无法保存，请把程序解压到桌面等可写的文件夹后重试。", fg="#ffc1d7")
+                return
+            self.apply_words(values)
+            panel.destroy()
+            self.settings_window = None
+            self.notify("祝福已保存，下次打开也会保留")
+
+        def defaults():
+            for key, entry in entries.items():
+                entry.delete(0, "end")
+                entry.insert(0, DEFAULT_TEXT[key])
+
+        tk.Button(row, text="恢复默认", command=defaults, font=("Microsoft YaHei UI", 10),
+                  bg="#302336", fg="#e7c3d5", activebackground="#453045", activeforeground="white",
+                  relief="flat", padx=13, pady=8, cursor="hand2").pack(side="left")
+        tk.Button(row, text="保存并应用", command=save, font=("Microsoft YaHei UI", 10),
+                  bg="#d296b4", fg="#261423", activebackground="#efb8cf", activeforeground="#261423",
+                  relief="flat", padx=20, pady=8, cursor="hand2").pack(side="right")
+        panel.bind("<Return>", lambda event: save())
+        panel.bind("<Escape>", lambda event: panel.destroy())
+        entries["主祝福"].focus_set()
+        entries["主祝福"].selection_range(0, "end")
+
+    def add_particle(self, x, y, z, size, color, phase, kind="tree"):
+        self.particles.append(dict(x=x, y=y, z=z, size=size, color=color,
+                                   phase=phase, kind=kind, shade=-1, depth=0))
+
+    def set_mouse(self, x, y):
+        self.mouse_x, self.mouse_y = x, y
+
+    def motion(self, event):
+        self.set_mouse(clamp((event.x - self.w / 2) / max(1, self.w / 2), -1, 1),
+                       clamp((event.y - self.h / 2) / max(1, self.h / 2), -1, 1))
+        x, y = (event.x - self.ox) / self.scale, (event.y - self.oy) / self.scale
+        star_x, star_y = self.scene_point(450, 232)
+        self.hover_star = math.hypot(x - star_x, y - star_y) < 35
+        current = self.canvas.find_withtag("current")
+        tags = self.canvas.gettags(current[0]) if current else ()
+        over_control = any(tag.startswith("control:") for tag in tags)
+        if not over_control:
+            self.canvas.configure(cursor="fleur" if self.dragging else ("hand2" if self.hover_star else ""))
+        now = time.perf_counter()
+        if not over_control and not self.paused and now >= self.next_trail:
+            self.mouse_trail.append(dict(x=x, y=y, age=0, phase=self.rng.uniform(0, TAU)))
+            self.mouse_trail = self.mouse_trail[-24:]
+            self.next_trail = now + 0.055
+
+    def press(self, event):
+        current = self.canvas.find_withtag("current")
+        tags = self.canvas.gettags(current[0]) if current else ()
+        for tag in tags:
+            if tag.startswith("control:"):
+                self.dragging = False
+                action = tag.split(":", 1)[1]
+                {"settings": self.open_settings, "pause": self.toggle_pause,
+                 "reset": self.reset_view, "fullscreen": self.toggle_fullscreen}[action]()
+                return "break"
+        self.dragging, self.drag_moved = True, False
+        self.drag_start = self.drag_last = event.x, event.y
+
+    def drag(self, event):
+        if not self.dragging:
+            return
+        if math.hypot(event.x - self.drag_start[0], event.y - self.drag_start[1]) > 5:
+            self.drag_moved = True
+        self.rotation += (event.x - self.drag_last[0]) / self.scale * 0.008
+        self.drag_last = event.x, event.y
+        self.motion(event)
+        if self.paused:
+            self.update_scene(0, force=True)
+
+    def release(self, event):
+        was_dragging = self.dragging
+        self.dragging = False
+        self.canvas.configure(cursor="")
+        if was_dragging and not self.drag_moved:
+            self.click(event)
+
+    def wheel(self, event, direction=None):
+        if direction is None:
+            direction = clamp(event.delta / 120, -3, 3)
+        self.zoom_target = clamp(self.zoom_target + direction * 0.035, 0.90, 1.08)
+        if self.paused:
+            self.zoom = self.zoom_target
+            self.update_scene(0, force=True)
+        return "break"
+
+    def reset_view(self, event=None):
+        self.rotation = 0.0
+        self.zoom = self.zoom_target = 1.0
+        self.camera_x = self.camera_y = self.mouse_x = self.mouse_y = 0.0
+        self.update_scene(0, force=True)
+        self.notify("已恢复默认视角")
+
+    def click(self, event):
+        x, y = (event.x - self.ox) / self.scale, (event.y - self.oy) / self.scale
+        star_x, star_y = self.scene_point(450, 232)
+        if math.hypot(x - star_x, y - star_y) < 35:
+            if self.elapsed >= self.next_wish:
+                self.star_magic = 1.0
+                self.next_wish = self.elapsed + 1.8
+                self.emit_burst(star_x, star_y, "wish")
+                self.notify("愿你的心愿，慢慢成真 ✦")
+        else:
+            self.emit_burst(x, y)
+        if self.paused:
+            self.update_scene(0, force=True)
+
+    def emit_burst(self, x, y, kind="heart"):
+        while len(self.bursts) >= 4:
+            for dot in self.bursts.pop(0)["dots"]:
+                if dot[0] is not None:
+                    self.canvas.delete(dot[0])
+        dots = []
+        count = 96 if kind == "wish" else 60
+        palette = 2 if kind == "wish" else 0
+        for i in range(count):
+            angle = i / count * TAU
+            hx, hy = heart(angle) if kind == "heart" else (math.cos(angle), math.sin(angle))
+            if kind == "wish":
+                length = 0.5 + (i % 7) / 12
+                hx, hy = hx * length, hy * length
+            item = None if self.raster_mode else self.image(x, y, self.sprites[palette, 1, 7], tags="burst")
+            dots.append((item, hx, hy))
+        self.bursts.append(dict(x=x, y=y, age=0, dots=dots, shade=-1, kind=kind, palette=palette))
+
+    def update_scene(self, dt, force=False):
+        t, c = self.elapsed, self.canvas
+        self.frame += 1
+        self.camera_x += (self.mouse_x - self.camera_x) * min(1, dt * 3)
+        self.camera_y += (self.mouse_y - self.camera_y) * min(1, dt * 3)
+        self.zoom += (self.zoom_target - self.zoom) * min(1, dt * 8)
+        self.star_magic = max(0, self.star_magic - dt / 2.4)
+        angle = t * 0.115 + self.rotation
+        cosine, sine = math.cos(angle), math.sin(angle)
+        breathe = 1 + math.sin(t * 1.1) * 0.005
+        update_color = force or self.frame % 4 == 0
+        # 开场从底部向树尖点亮；重建窗口不重放开场。
+        reveal = smooth(t / 3.3)
+        for p in self.particles:
+            z = p["z"] * cosine - p["x"] * sine
+            x = (p["x"] * cosine + p["z"] * sine) * breathe
+            perspective = 1100 / (1100 + z)
+            x = 450 + x * perspective + self.camera_x * (p["y"] - 470) * 0.025
+            y = 480 + (p["y"] - 480) * perspective + self.camera_y * z * 0.027
+            x, y = self.scene_point(x, y)
+            sx, sy = self.xy(x, y)
+            p["screen"] = sx, sy
+            depth = clamp((1 - z / 250) * 0.5)
+            if not self.raster_mode:
+                radius = (0.65, 0.85, 1.10, 1.60)[p["size"]] * (0.68 + depth * 0.54) * self.scale
+                c.coords(p["item"], sx - radius, sy - radius, sx + radius, sy + radius)
+                if p["halo"] is not None:
+                    c.coords(p["halo"], sx, sy)
+            p["depth"] = z
+            if update_color:
+                flicker = (math.sin(t * 1.8 + p["phase"]) + 1) * 0.5
+                strength = 0.14 + 0.60 * depth + 0.25 * flicker
+                if p["kind"] == "ribbon":
+                    strength = 0.28 + 0.48 * depth + 0.23 * flicker
+                if p["kind"] == "jewel":
+                    strength = 0.52 + 0.33 * flicker
+                u = clamp((p["y"] - 245) / 465)
+                visible = smooth((reveal - (1 - u) * 0.76) / 0.24)
+                shade = round(clamp(strength * visible) * 7)
+                state = "normal" if visible > 0.01 else "hidden"
+                if not self.raster_mode and (shade != p["shade"] or force or state != p.get("state")):
+                    c.itemconfigure(p["item"], fill=self.colors[p["color"], shade], state=state)
+                    if p["halo"] is not None:
+                        c.itemconfigure(p["halo"], image=self.sprites[p["color"], p["size"], shade], state=state)
+                p["shade"], p["state"] = shade, state
+
+        # 后面的点先画，灯带和树身共用深度排序。
+        if force or t - self.last_sort > 0.20:
+            self.draw_order = sorted(self.particles, key=lambda value: value["depth"], reverse=True)
+            if not self.raster_mode:
+                for p in self.draw_order:
+                    if p["halo"] is not None:
+                        c.tag_raise(p["halo"])
+                    c.tag_raise(p["item"])
+            for tag in ("star", "snow", "spark", "foreground", "burst"):
+                c.tag_raise(tag)
+            self.last_sort = t
+
+        if self.raster_mode:
+            frame = self.base_frame.copy()
+            for p in self.draw_order:
+                if p["state"] == "hidden":
+                    continue
+                sprite = self.pil_sprites[p["color"], p["size"], p["shade"]]
+                half = sprite.width // 2
+                sx, sy = p["screen"]
+                frame.paste(sprite, (round(sx) - half, round(sy) - half), sprite)
+
+        pulse = 1 + 0.055 * math.sin(t * 1.65) + self.star_magic * 0.32 + (0.08 if self.hover_star else 0)
+        star_x, star_y = self.scene_point(450, 232)
+        self.coords(self.star_halo, star_x, star_y)
+        self.coords(self.star_glow, star_x, star_y)
+        points = []
+        for i in range(10):
+            a = -math.pi / 2 + i * math.pi / 5 + 0.035 * math.sin(t * 0.7)
+            radius = (17.5 if i % 2 == 0 else 7.1) * pulse * self.zoom
+            points.extend(self.xy(star_x + radius * math.cos(a), star_y + radius * math.sin(a)))
+        c.coords(self.star, *points)
+        c.itemconfigure(self.star, fill=mix("#e8bc91", "#fff0d6", (math.sin(t * 1.65) + 1) / 2))
+        for i, ray in enumerate(self.star_rays):
+            a = i * math.pi / 4
+            inner, outer = 24 * pulse, (39 if i % 2 == 0 else 30) * pulse
+            c.coords(ray, *self.xy(star_x + inner * math.cos(a), star_y + inner * math.sin(a)),
+                     *self.xy(star_x + outer * math.cos(a), star_y + outer * math.sin(a)))
+
+        for f in self.snow:
+            f["y"] += f["speed"] * dt
+            f["x"] += (2 + math.sin(t * 0.6 + f["phase"]) * 10) * dt
+            if f["y"] > HEIGHT + 20:
+                f["y"], f["x"] = -20, self.rng.uniform(-20, WIDTH + 20)
+            if f["x"] > WIDTH + 30:
+                f["x"] = -30
+            elif f["x"] < -30:
+                f["x"] = WIDTH + 30
+            sx, sy = self.xy(f["x"] + self.camera_x * f["depth"] * 6,
+                             f["y"] + self.camera_y * f["depth"] * 3)
+            if self.raster_mode:
+                sprite = f["sprite"]
+                half = sprite.width // 2
+                frame.paste(sprite, (round(sx) - half, round(sy) - half), sprite)
+            elif f["near"]:
+                c.coords(f["item"], sx, sy)
+            else:
+                r = f["radius"] * self.scale
+                c.coords(f["item"], sx - r, sy - r, sx + r, sy + r)
+
+        for spark in self.sparks:
+            light = max(0, math.sin(t * 1.15 + spark["phase"])) ** 12
+            x = spark["x"] + 3 * math.sin(t * 0.3 + spark["phase"])
+            y = spark["y"] - 3 * math.sin(t * 0.5 + spark["phase"])
+            for i, ray in enumerate(spark["rays"]):
+                length = (5.0 if i == 0 else 3.3) * light
+                dx, dy = (length, 0) if i == 0 else (0, length)
+                c.coords(ray, *self.xy(x - dx, y - dy), *self.xy(x + dx, y + dy))
+                if update_color:
+                    c.itemconfigure(ray, fill=mix("#392335", "#f7e2d6", light))
+
+        # 文字更新到完全显现后停止，避免无意义的 Tcl 调用。
+        text_step = min(120, int(t * 15))
+        if text_step != self.last_text or force:
+            for item, x, i in self.letters:
+                progress = smooth((t - self.text_started - i * min(0.16, 1.5 / max(1, len(self.words["主祝福"])))) / 1.5)
+                c.itemconfigure(item, fill=mix(BG, "#f6d6e2", progress),
+                                state="normal" if progress else "hidden")
+                self.coords(item, x, 808 + 9 * (1 - progress))
+            c.itemconfigure(self.subtitle, fill=mix(BG, "#c79caf", smooth((t - self.text_started - 1.9) / 1.8)))
+            self.last_text = text_step
+
+        live = []
+        for burst in self.bursts:
+            burst["age"] += dt
+            age = burst["age"]
+            if age > 2.6:
+                for item, _, _ in burst["dots"]:
+                    if item is not None:
+                        c.delete(item)
+                continue
+            expansion = 8 + (150 if burst["kind"] == "wish" else 63) * (1 - math.exp(-age * 3.2))
+            shade = round(7 * (1 - smooth((age - 0.7) / 1.9)))
+            for item, hx, hy in burst["dots"]:
+                x = burst["x"] + hx * expansion
+                y = burst["y"] + hy * expansion + age * (24 if burst["kind"] == "wish" else -27)
+                key = burst["palette"], 1, shade
+                if self.raster_mode:
+                    sprite = self.pil_sprites[key]
+                    half = sprite.width // 2
+                    sx, sy = self.xy(x, y)
+                    frame.paste(sprite, (round(sx) - half, round(sy) - half), sprite)
+                else:
+                    self.coords(item, x, y)
+                    if shade != burst["shade"]:
+                        c.itemconfigure(item, image=self.sprites[key])
+            burst["shade"] = shade
+            live.append(burst)
+        self.bursts = live
+        if self.raster_mode:
+            alive_trail = []
+            for point in self.mouse_trail:
+                point["age"] += dt
+                if point["age"] > 0.85:
+                    continue
+                shade = round(5 * (1 - point["age"] / 0.85))
+                sprite = self.pil_sprites[2, 0, shade]
+                half = sprite.width // 2
+                sx, sy = self.xy(point["x"], point["y"] - point["age"] * 12)
+                frame.paste(sprite, (round(sx) - half, round(sy) - half), sprite)
+                alive_trail.append(point)
+            self.mouse_trail = alive_trail
+            self.frame_image.paste(frame)
+
+    def tick(self):
+        if not self.running:
+            return
+        start = time.perf_counter()
+        dt = min(start - self.last, 0.08)
+        self.last = start
+        if self.toast_until and start > self.toast_until:
+            self.canvas.itemconfigure(self.toast, state="hidden")
+            self.toast_until = 0.0
+        if not self.paused and self.resize_job is None:
+            self.elapsed += dt
+            self.update_scene(dt)
+        cost = time.perf_counter() - start
+        self.job = self.root.after(max(1, round(1000 / max(1, FPS) - cost * 1000)), self.tick)
+
+    def toggle_pause(self, event=None):
+        self.paused = not self.paused
+        self.canvas.itemconfigure(self.pause_label, state="normal" if self.paused else "hidden")
+        if "pause" in self.controls:
+            self.canvas.itemconfigure(self.controls["pause"][1], text="继续" if self.paused else "暂停")
+        self.last = time.perf_counter()
+
+    def toggle_fullscreen(self, event=None):
+        self.fullscreen = not self.fullscreen
+        self.root.attributes("-fullscreen", self.fullscreen)
+        if "fullscreen" in self.controls:
+            self.canvas.itemconfigure(self.controls["fullscreen"][1], text="退出全屏" if self.fullscreen else "全屏")
+
+    def escape(self, event=None):
+        if self.fullscreen:
+            self.toggle_fullscreen()
+        else:
+            self.close()
+
+    def close(self):
+        if not self.running:
+            return
+        self.running = False
+        for job in (self.job, self.resize_job):
+            if job is not None:
+                self.root.after_cancel(job)
+        if self.timer_enabled:
+            ctypes.windll.winmm.timeEndPeriod(1)
+        self.root.destroy()
+
+
+if __name__ == "__main__":
+    root = None
+    try:
+        root = tk.Tk()
+        app = ChristmasAtelier(root)
+
+        def callback_error(kind, value, trace):
+            app.paused = True
+            messagebox.showerror("程序遇到问题", "动画暂时停止，请关闭后重新打开。\n\n" + str(value), parent=root)
+            app.close()
+
+        root.report_callback_exception = callback_error
+        root.mainloop()
+    except Exception as error:
+        message = "圣诞树暂时无法打开，请完整解压文件包后重试。\n\n" + str(error)
+        if root is not None:
+            messagebox.showerror("粉金星愿", message, parent=root)
+        elif os.name == "nt":
+            ctypes.windll.user32.MessageBoxW(None, message, "粉金星愿", 0x10)
+        else:
+            raise
